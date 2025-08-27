@@ -1,196 +1,128 @@
-# -*- coding: utf-8 -*-
-"""
-Source: Pévèle Carembault via Publidata (WasteCollection)
-Flux: (city_name|citycode) -> geocoder -> events
-"""
-from __future__ import annotations
-
-import datetime as dt
-from typing import Dict, List, Optional, Any, Sequence, Union
+import json
+import re
+from datetime import datetime
+from urllib.parse import urlencode
 
 import requests
 from waste_collection_schedule import Collection  # type: ignore[attr-defined]
 
 TITLE = "Pévèle Carembault (Publidata)"
-DESCRIPTION = "Collectes via API Publidata (recherche ville -> geocoder -> calendrier)."
-URL = "https://www.pevelecarembault.fr/mon-quotidien/mes-dechets/calendrier-de-collecte"
-
-# Endpoints Publidata génériques
-CITY_SEARCH_URL = "https://api.publidata.io/v2/search"
-GEOCODER_URL = "https://api.publidata.io/v2/geocoder"
-
-# par défaut on devine l'endpoint events le plus commun; tu peux le surcharger
-DEFAULT_EVENTS_URL = "https://api.publidata.io/v2/waste_collection/events"
-
-# Chemins/Clés JSON (ajuste si besoin)
-CITY_ARRAY_PATH: Sequence[Union[str, int]] = ["items"]
-CITY_CODE_FIELD = "insee_code"
-
-ADDR_ARRAY_PATH: Sequence[Union[str, int]] = ["features"]  # geocoder type=FeatureCollection
-ADDR_ID_PATH: Sequence[Union[str, int]] = ["properties", "id"]
-
-EVENTS_ARRAY_PATH: Sequence[Union[str, int]] = ["items"]
-EVENT_DATE_FIELD = "date"
-EVENT_TYPE_FIELD = "stream"
-
-# Liste INSEE autorisée (depuis ta réponse next.publidata.io/api/instances/Ad7D6tp4LB/)
-INSEE_WHITELIST_DEFAULT = [
-    "59004","59022","59029","59034","59042","59071","59080","59096","59105","59123","59124",
-    "59129","59145","59150","59158","59168","59197","59258","59266","59304","59330","59364",
-    "59398","59408","59411","59419","59427","59435","59449","59452","59462","59466","59551",
-    "59586","59592","59600","59630","59638"
-]
-
-TEST_CASES: Dict[str, Dict[str, str]] = {
-    # Beuvry-la-Forêt (59080) – à adapter côté q / rue
-    "BeuvryLaForet": {
-        "citycode": "59080",
-        "q": "965 Rue",  # ta requête geocoder
-        # "events_url": "https://api.publidata.io/v2/…/events",  # à coller si différent
-    },
+DESCRIPTION = "Scrape du widget Publidata calendrier (fallback sans ICS ni API events)"
+URL = "https://www.pevelecarembault.fr"
+TEST_CASES = {
+    # Exemple avec ID d’adresse direct (celui que tu as donné)
+    "Adresse par ID": {"address_id": "59080_0360_00965"},
+    # Exemple via texte + code INSEE
+    "Texte + INSEE": {"q": "965 Rue", "citycode": "59080"},
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; WasteCollectionSchedule/1.0; +https://github.com/mampfes/hacs_waste_collection_schedule)"
-}
+WIDGET_INSTANCE_SLUG = "Ad7D6tp4LB"  # instance Widgets “Mes déchets”
+WIDGET_BASE = f"https://widgets.publidata.io/{WIDGET_INSTANCE_SLUG}"
 
-
-def _dig(obj: Any, path: Sequence[Union[str, int]]) -> Any:
-    cur = obj
-    for key in path:
-        if isinstance(key, int):
-            cur = cur[key]
-        else:
-            if not isinstance(cur, dict):
-                raise KeyError(f"JSON: niveau non-dict avant '{key}'")
-            cur = cur.get(key)
-        if cur is None:
-            raise KeyError(f"JSON: clé/index manquant '{key}' pour chemin {path}")
-    return cur
+GEOCODER_BASE = "https://api.publidata.io/v2/geocoder"
+SEARCH_BASE = "https://api.publidata.io/v2/search"
 
 
 class Source:
-    """
-    Args YAML supportés:
-      - citycode: str (ex "59080") OU
-      - city_name: str (ex "Beuvry")  # si tu ne connais pas l'INSEE
-      - insee_whitelist: list[str]    # sinon celle par défaut est utilisée
-      - q: str                        # requête geocoder (ex "965 Rue")
-      - events_url: str               # pour surcharger l'URL des events si différente du défaut
-      - events_extra_params: dict     # pour ajouter dataset/from/to/instance/etc.
-      - type_map: dict                # remap libellés bruts -> finaux
-    """
-    def __init__(
-        self,
-        citycode: Optional[str] = None,
-        city_name: Optional[str] = None,
-        insee_whitelist: Optional[List[str]] = None,
-        q: Optional[str] = None,
-        events_url: Optional[str] = None,
-        events_extra_params: Optional[Dict[str, str]] = None,
-        type_map: Optional[Dict[str, str]] = None,
-        session: Optional[requests.Session] = None,
-        tz: str = "Europe/Paris",
-    ):
-        self._citycode = citycode
-        self._city_name = city_name
-        self._insee_whitelist = insee_whitelist or INSEE_WHITELIST_DEFAULT
-        self._q = (q or "").strip()
-        self._events_url = (events_url or DEFAULT_EVENTS_URL).rstrip("/")
-        self._events_extra_params = events_extra_params or {}
-        self._type_map = type_map or {}
-        self._tz = tz
-        self._s = session or requests.Session()
+    def __init__(self, address_id=None, q=None, citycode=None, timeout=20):
+        """
+        address_id: ex '59080_0360_00965' (recommandé si disponible)
+        q: texte de recherche d'adresse (ex: '965 Rue')
+        citycode: code INSEE de la commune (ex: '59080')
+        """
+        self.address_id = address_id
+        self.q = q
+        self.citycode = citycode
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "User-Agent": "waste_collection_schedule/pevele_publidata (+https://github.com/mampfes/hacs_waste_collection_schedule)",
+                "Accept": "text/html,application/json",
+            }
+        )
+        self.timeout = timeout
 
-    # --- étape 1: citycode (si non fourni)
-    def _resolve_citycode(self) -> str:
-        if self._citycode:
-            return self._citycode
-        if not self._city_name:
-            raise ValueError("Fournis 'citycode' ou 'city_name'")
-
-        params = {
-            "size": 1000,
-            "types[]": "city",
-            "select[]": ["full_name", "postal_codes", "insee_code", "address_count"],
-            "q": self._city_name,
-        }
-        # applique la whitelist INSEE (répétition de la même clé)
-        for code in self._insee_whitelist:
-            params.setdefault("insee_codes[]", [])
-            params["insee_codes[]"].append(code)
-
-        resp = self._s.get(CITY_SEARCH_URL, params=params, headers=HEADERS, timeout=30)
+    # ------------- utils HTTP
+    def _get(self, url, **kwargs):
+        resp = self._session.get(url, timeout=self.timeout, **kwargs)
         resp.raise_for_status()
-        items = _dig(resp.json(), CITY_ARRAY_PATH)
-        if not items:
-            raise ValueError("Aucune ville trouvée")
-        citycode = items[0].get(CITY_CODE_FIELD)
-        if not citycode:
-            raise ValueError("Champ 'insee_code' absent")
-        return str(citycode)
+        return resp
 
-    # --- étape 2: geocoder -> id adresse
-    def _geocode(self, citycode: str) -> str:
-        if not self._q:
-            raise ValueError("Paramètre 'q' manquant pour le geocoder (ex: '965 Rue')")
+    # ------------- résolution adresse
+    def _resolve_address_id(self) -> str:
+        if self.address_id:
+            return self.address_id
 
-        params = {
-            "q": self._q,
-            "limit": 10000,
-            "lookup": "publidata",
-            "citycode": citycode,
-        }
-        resp = self._s.get(GEOCODER_URL, params=params, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        arr = _dig(resp.json(), ADDR_ARRAY_PATH)
-        if not arr:
-            raise ValueError("Aucune adresse trouvée via le geocoder")
+        if not (self.q and self.citycode):
+            raise ValueError("Fournir address_id OU (q + citycode)")
 
-        # essaie features[0].properties.id, sinon items[0].id
-        addr = arr[0]
-        try:
-            address_id = _dig(addr, ADDR_ID_PATH)
-        except Exception:
-            address_id = addr.get("id")
+        # Géocoder par texte dans une commune
+        params = {"q": self.q, "limit": 100, "lookup": "publidata", "citycode": self.citycode}
+        r = self._get(f"{GEOCODER_BASE}", params=params).json()
+        feats = r.get("features") or []
+        if not feats:
+            raise ValueError("Adresse introuvable avec le géocoder Publidata")
+        # on prend le 1er résultat certifié si possible
+        best = next((f for f in feats if f["properties"].get("certification")), feats[0])
+        addr_id = best["properties"]["id"]
+        if not addr_id:
+            raise ValueError("Pas d'ID d'adresse dans la réponse Publidata")
+        return addr_id
 
-        if not address_id:
-            raise ValueError("Identifiant d'adresse introuvable")
-        return str(address_id)
+    # ------------- extraction du JSON Next.js
+    def _extract_next_data(self, html: str) -> dict:
+        # Cherche le script __NEXT_DATA__
+        m = re.search(r"<script[^>]+id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>", html, re.DOTALL | re.IGNORECASE)
+        if not m:
+            raise ValueError("JSON __NEXT_DATA__ introuvable dans la page calendrier")
+        raw = m.group(1)
+        return json.loads(raw)
 
-    # --- étape 3: events
-    def _fetch_events(self, address_id: str) -> List[dict]:
-        params = {"address_id": address_id}
-        params.update(self._events_extra_params)
+    # ------------- détection des événements dans le state
+    def _iter_events_from_state(self, data: dict):
+        """
+        Les structures peuvent varier; on balaie tout le JSON et on collecte
+        les objets qui ressemblent à des événements (date + libellé).
+        """
+        iso_date = re.compile(r"^\d{4}-\d{2}-\d{2}")
+        stack = [data]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                # heuristique: {date: "YYYY-MM-DD", type/libelle/...}
+                if "date" in cur and isinstance(cur["date"], str) and iso_date.match(cur["date"]):
+                    # champ "types" / "label" / "name" selon les installations
+                    label = (
+                        cur.get("label")
+                        or cur.get("name")
+                        or cur.get("type")
+                        or cur.get("wasteType")
+                        or "Collecte"
+                    )
+                    yield cur["date"], str(label)
+                stack.extend(cur.values())
+            elif isinstance(cur, list):
+                stack.extend(cur)
 
-        resp = self._s.get(self._events_url, params=params, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        events = _dig(resp.json(), EVENTS_ARRAY_PATH)
-        if not isinstance(events, list):
-            raise ValueError("Réponse 'events' inattendue (pas une liste)")
-        return events
+    def fetch(self):
+        addr_id = self._resolve_address_id()
 
-    def fetch(self) -> List[Collection]:
-        citycode = self._resolve_citycode()
-        address_id = self._geocode(citycode)
-        events = self._fetch_events(address_id)
+        # Appel page calendrier hydratée
+        params = {"address_id": addr_id}
+        html = self._get(f"{WIDGET_BASE}/calendar", params=params).text
 
-        out: List[Collection] = []
-        for ev in events:
-            raw_type = (ev.get(EVENT_TYPE_FIELD) or "").strip()
-            t = self._type_map.get(raw_type, raw_type)
+        data = self._extract_next_data(html)
 
-            date_str = ev.get(EVENT_DATE_FIELD)
-            if not date_str:
-                continue
-            # normalise en date
-            try:
-                d = dt.date.fromisoformat(date_str[:10])
-            except Exception:
-                try:
-                    d = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
-                except Exception:
-                    continue
+        # Itère et agrège par date -> [types]
+        buckets = {}
+        for d, label in self._iter_events_from_state(data):
+            buckets.setdefault(d, set()).add(label)
 
-            out.append(Collection(date=d, t=t))
+        # Construit les Collection[]
+        out = []
+        for d, labels in sorted(buckets.items()):
+            dt = datetime.strptime(d, "%Y-%m-%d").date()
+            # titre compact: "Verre, Emballages"
+            title = ", ".join(sorted(labels))
+            out.append(Collection(date=dt, t=title))
         return out
