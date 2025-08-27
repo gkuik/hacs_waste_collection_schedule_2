@@ -26,6 +26,11 @@ URL = "https://www.publidata.io/fr/"
 COUNTRY = "fr"
 
 TEST_CASES = {
+    "Pévèle Carembault, Beuvry-la-Forêt": {
+        "address": "965 Rue Jacques Varlet",
+        "insee_code": "59080",
+        "instance_id": 1140,
+    },
     "GPSEO, Mantes la Ville": {
         "address": "11 rue Jean Moulin",
         "insee_code": "78362",
@@ -158,6 +163,11 @@ PARAM_TRANSLATIONS = {
 
 EXTRA_INFO = [
     {
+        "title": "Pévèle Carembault",
+        "url": "https://next.publidata.io/Ad7D6tp4LB/",
+        "default_params": {"instance_id": 1140},
+    },
+    {
         "title": "Grand Paris Seine et Oise",
         "url": "https://infos-dechets.gpseo.fr/",
         "default_params": {"instance_id": 1294},
@@ -240,7 +250,6 @@ _CALENDAR_DAY_VERY_ABBR = {
 }
 
 _CALENDAR_MONTHS_ABBR = [m for m in calendar.month_abbr if m]
-
 
 class Source:
     geocoder_url = "https://api.publidata.io/v2/geocoder"
