@@ -291,6 +291,8 @@ class Source:
             "types[]": "Platform::Services::WasteCollection",
             "collection_modes[]": "truck",
             "instances[]": self.instance_id,
+            "publics[]": "resident",
+            "public_types[]": "individual_housing",
             **self.address_params,
         }
 
@@ -352,15 +354,24 @@ class Source:
         """
         result = {}
         hits = data.get("hits", {}).get("hits", [])
-        if not hits:
-            raise Exception("Unexpected response format")
+        if hits is None:
+            raise Exception("Unexpected response format: missing hits")
 
         for hit in hits:
-            source = hit.get("_source", {})
-            if source.get("metas", {}).get("sectorization") == "single":
-                garbage_type = source.get("metas", {}).get("garbage_types", [""])[0]
-                if garbage_type:
-                    result[garbage_type] = {"schedules": source.get("schedules", {})}
+            src = hit.get("_source", {}) or {}
+            schedules = src.get("schedules") or []
+            if not schedules:
+                continue
+            gtypes = src.get("metas", {}).get("garbage_types") or []
+            # Cas normal : la collectivité fournit la(les) filière(s)
+            if gtypes:
+                for gt in gtypes:
+                    bucket = result.setdefault(gt, {"schedules": []})
+                    bucket["schedules"].extend(schedules)
+            else:
+                # Fallback (rare) : on regroupe sous une clé générique
+                bucket = result.setdefault("unknown", {"schedules": []})
+                bucket["schedules"].extend(schedules)
         return result
 
     def _parse_closure(self, schedule):
